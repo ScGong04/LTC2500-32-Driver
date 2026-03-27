@@ -1,5 +1,6 @@
 module ltc_driver_fsm #(
     parameter int DATA_WIDTH = 32,
+    parameter int ETH_DATA_WIDTH = 8,
     parameter int CLK_FREQ   = 100_000_000, // 100 M
     parameter int DF         = 64           // Down-Sampling Factor
 )(
@@ -19,8 +20,12 @@ module ltc_driver_fsm #(
     output logic o_scka,
     output logic o_rdla,
     input  wire  i_sdoa,
+    
+    output logic [3:0] o_debug_state,
 
-    output wire [DATA_WIDTH-1:0] o_read_data,
+    output logic [DATA_WIDTH-1:0] o_read_data,
+    output logic [ETH_DATA_WIDTH-1:0] o_eth_data,
+    output logic o_eth_valid,
     output logic o_data_valid,
     output logic o_error
 );
@@ -39,17 +44,23 @@ typedef enum logic [3:0] {
     STATE_WAIT_DRL,
     STATE_QUIET,
     STATE_READ_DATA,
+    STATE_READ_DONE,
+    STATE_SEND_ETH,
     STATE_STOP,
     STATE_ERROR 
 } state_t; 
 
 state_t state, next_state;
 
+assign o_debug_state = state;
+
 logic [31:0] shift_reg;
 logic bit_en, bit_clr;
 logic delay_en, delay_clr;
+logic eth_byte_en, eth_byte_clr;
 logic [5:0] bit_cnt;
 logic [7:0] delay_cnt;
+logic [2:0] eth_byte_cnt;
 
 logic [6:0] mclk_cnt;
 logic mclk_cnt_en, mclk_cnt_clr;
@@ -62,10 +73,12 @@ logic next_error;
 assign o_sync = 1'b0;
 assign o_pre  = 1'b1; 
 assign o_sdi  = 1'b0;
-assign o_read_data = shift_reg;
 
 logic sck_en;
 logic [3:0] sck_cnt;
+
+logic next_eth_valid;
+logic [7:0] next_eth_data;
 
 always_ff @(posedge i_clk or negedge i_rst_n) begin
     if (~i_rst_n) begin
@@ -130,16 +143,32 @@ always_ff @(posedge i_clk or negedge i_rst_n) begin
 end
 
 always_ff @(posedge i_clk or negedge i_rst_n) begin
+    if (~i_rst_n)          eth_byte_cnt <= '0;
+    else if (eth_byte_clr) eth_byte_cnt <= '0;
+    else if (eth_byte_en)  eth_byte_cnt <= eth_byte_cnt + 1'b1;
+end
+
+always_ff @(posedge i_clk or negedge i_rst_n) begin
     if (~i_rst_n)          mclk_cnt <= '0;
     else if (mclk_cnt_clr) mclk_cnt <= '0;
     else if (mclk_cnt_en)  mclk_cnt <= mclk_cnt + 1'b1;
-end
+end 
 
 always_ff @(posedge i_clk or negedge i_rst_n) begin
     if (~i_rst_n) begin
         shift_reg <= '0;
     end else if (state == STATE_READ_DATA && sck_negedge) begin
         shift_reg <= {shift_reg[30:0], i_sdoa}; 
+    end
+end
+
+always_ff @(posedge i_clk or negedge i_rst_n) begin
+    if (~i_rst_n) begin 
+        o_eth_data  <= '0;
+        o_eth_valid <= 1'b0;
+    end else begin
+        o_eth_data  <= next_eth_data;
+        o_eth_valid <= next_eth_valid;
     end
 end
 
@@ -159,12 +188,21 @@ always_ff @(posedge i_clk or negedge i_rst_n) begin
     end
 end
 
+always_ff @(posedge i_clk or negedge i_rst_n) begin
+    if (~i_rst_n) begin
+        o_read_data <= '0;
+    end else if (state == STATE_READ_DONE) begin
+        o_read_data <= shift_reg;
+    end
+end
 
 always_comb begin
     next_state      = state;
     next_mclk       = o_mclk;
     next_rdla       = o_rdla;
     next_data_valid = 1'b0;
+    next_eth_valid  = 1'b0;
+    next_eth_data   = o_eth_data;
     next_error      = o_error;
 
     sck_en       = 1'b0;
@@ -172,6 +210,8 @@ always_comb begin
     delay_clr    = 1'b0;
     bit_en       = 1'b0;
     bit_clr      = 1'b0;
+    eth_byte_en  = 1'b0;
+    eth_byte_clr = 1'b0;
     mclk_cnt_en  = 1'b0;
     mclk_cnt_clr = 1'b0;
 
@@ -248,16 +288,41 @@ always_comb begin
             bit_en    = sck_negedge; 
 
             if (bit_cnt == 6'd32) begin
-                next_state = STATE_STOP;
+                next_state = STATE_READ_DONE;
                 sck_en     = 1'b0;
                 delay_clr  = 1'b1;
+            end
+        end
+
+        STATE_READ_DONE: begin
+            next_data_valid = 1'b1;
+            eth_byte_clr    = 1'b1;
+            next_state      = STATE_SEND_ETH;
+        end
+        
+        STATE_SEND_ETH: begin
+            eth_byte_en = 1'b1;
+            
+            next_eth_valid = ~eth_byte_cnt[0];
+
+            case(eth_byte_cnt[2:1])
+                2'b00: next_eth_data = shift_reg[31:24]; // count = 0, 1
+                2'b01: next_eth_data = shift_reg[23:16]; // count = 2, 3
+                2'b10: next_eth_data = shift_reg[15:8];  // count = 4, 5
+                2'b11: next_eth_data = shift_reg[7:0];   // count = 6, 7
+                default: next_eth_data = '0;
+            endcase 
+
+            if (eth_byte_cnt == 3'd7) begin
+                eth_byte_en = 1'b0;
+                next_state = STATE_STOP;
+                eth_byte_clr = 1'b1;
             end
         end
 
         STATE_STOP: begin
             delay_en = 1'b1;       
             if (delay_cnt >= CYCLES_MCLKL - 1) begin
-                next_data_valid = 1'b1;
                 next_state      = STATE_IDLE;
                 delay_clr       = 1'b1;
             end    
